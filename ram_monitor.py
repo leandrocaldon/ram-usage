@@ -13,6 +13,8 @@ import subprocess
 # ---- Configuración ----
 INTERVALO_MS = 1500          # Actualizar cada 1.5 segundos
 N_PROCESOS = 5               # Cuántos procesos mostrar
+N_HISTORIAL = 60             # Lecturas del gráfico (~90 s)
+UMBRAL_ALERTA = 85           # Avisar al cruzar este porcentaje
 
 
 def leer_meminfo():
@@ -45,6 +47,7 @@ def obtener_datos_ram():
     swap_total = info.get("SwapTotal", 0)
     swap_libre = info.get("SwapFree", 0)
     swap_usada = swap_total - swap_libre
+    cache = info.get("Buffers", 0) + info.get("Cached", 0)
 
     return {
         "total": total,
@@ -53,14 +56,15 @@ def obtener_datos_ram():
         "porcentaje": porcentaje,
         "swap_total": swap_total,
         "swap_usada": swap_usada,
+        "cache": cache,
     }
 
 
 def obtener_top_procesos(n=5):
-    """Devuelve una lista de (nombre, mem_mb) con los procesos que más RAM usan."""
+    """Devuelve una lista de (pid, nombre, mem_mb) con los procesos que más RAM usan."""
     try:
         salida = subprocess.check_output(
-            ["ps", "-eo", "comm,rss", "--sort=-rss", "--no-headers"],
+            ["ps", "-eo", "pid,comm,rss", "--sort=-rss", "--no-headers"],
             text=True, timeout=5
         )
     except Exception:
@@ -68,17 +72,36 @@ def obtener_top_procesos(n=5):
 
     procesos = []
     for linea in salida.strip().splitlines():
-        partes = linea.split(None, 1)
-        if len(partes) == 2:
-            nombre = partes[0]
-            try:
-                mem_mb = int(partes[1]) / 1024
-            except ValueError:
-                continue
-            procesos.append((nombre, mem_mb))
+        partes = linea.split()
+        if len(partes) < 3:
+            continue
+        pid = partes[0]
+        nombre = " ".join(partes[1:-1])
+        try:
+            mem_mb = int(partes[-1]) / 1024
+        except ValueError:
+            continue
+        procesos.append((pid, nombre, mem_mb))
         if len(procesos) >= n:
             break
     return procesos
+
+
+def avisar_ram_alta(porcentaje):
+    """Avisa una vez con notify-send. No hace nada si no está instalado."""
+    try:
+        subprocess.run(
+            [
+                "notify-send",
+                "-u", "critical",
+                "Monitor de RAM",
+                f"Uso de RAM al {porcentaje:.0f}%",
+            ],
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def kb_a_humano(kb):
@@ -101,9 +124,12 @@ class MonitorRAM:
     def __init__(self, raiz):
         self.raiz = raiz
         raiz.title("Monitor de RAM")
-        raiz.geometry("360x300")
+        raiz.geometry("360x390")
         raiz.configure(bg="#1e1e1e")
         raiz.resizable(False, False)
+
+        self.historial = []
+        self.en_alerta = False
 
         # Fuentes
         self.f_titulo = tkfont.Font(family="Sans", size=11, weight="bold")
@@ -127,10 +153,20 @@ class MonitorRAM:
         self.barra = self.canvas.create_rectangle(2, 2, 2, 20, fill="#2ecc71",
                                                   outline="")
 
+        # Historial de los últimos ~90 segundos
+        self.hist_canvas = tk.Canvas(raiz, width=300, height=36, bg="#333333",
+                                     highlightthickness=0)
+        self.hist_canvas.pack(pady=(0, 6))
+
         # Texto usada / total
         self.lbl_detalle = tk.Label(raiz, text="", bg="#1e1e1e", fg="#dddddd",
                                     font=self.f_normal)
         self.lbl_detalle.pack()
+
+        # Caché
+        self.lbl_cache = tk.Label(raiz, text="", bg="#1e1e1e", fg="#888888",
+                                  font=self.f_normal)
+        self.lbl_cache.pack()
 
         # Swap
         self.lbl_swap = tk.Label(raiz, text="", bg="#1e1e1e", fg="#888888",
@@ -166,11 +202,21 @@ class MonitorRAM:
         self.canvas.coords(self.barra, 2, 2, ancho, 20)
         self.canvas.itemconfig(self.barra, fill=color)
 
+        # Historial y aviso
+        self.historial.append(p)
+        if len(self.historial) > N_HISTORIAL:
+            self.historial.pop(0)
+        self.dibujar_historial()
+        self.revisar_alerta(p)
+
         # Detalle
         self.lbl_detalle.config(
             text=f"{kb_a_humano(datos['usada'])} usados de "
                  f"{kb_a_humano(datos['total'])}"
         )
+
+        # Caché
+        self.lbl_cache.config(text=f"Caché: {kb_a_humano(datos['cache'])}")
 
         # Swap
         if datos["swap_total"] > 0:
@@ -183,12 +229,39 @@ class MonitorRAM:
 
         # Procesos
         lineas = []
-        for nombre, mem in obtener_top_procesos(N_PROCESOS):
-            lineas.append(f"{nombre[:18]:<18} {mem:>7.1f} MB")
+        for pid, nombre, mem in obtener_top_procesos(N_PROCESOS):
+            lineas.append(f"{pid:>7} {nombre[:14]:<14} {mem:>7.1f} MB")
         self.lbl_procesos.config(text="\n".join(lineas))
 
         # Reprogramar
         self.raiz.after(INTERVALO_MS, self.actualizar)
+
+    def dibujar_historial(self):
+        """Dibuja una barra por lectura, alineada a la derecha."""
+        self.hist_canvas.delete("hist")
+        ancho = 300
+        alto = 36
+        paso = ancho / N_HISTORIAL
+        offset = N_HISTORIAL - len(self.historial)
+        for i, valor in enumerate(self.historial):
+            x0 = (offset + i) * paso
+            x1 = x0 + max(paso - 1, 1)
+            h = max(1, (alto - 2) * valor / 100)
+            self.hist_canvas.create_rectangle(
+                x0, alto - 1 - h, x1, alto - 1,
+                fill=color_por_porcentaje(valor),
+                outline="",
+                tags="hist",
+            )
+
+    def revisar_alerta(self, porcentaje):
+        """Avisa solo al cruzar el umbral hacia arriba."""
+        if porcentaje >= UMBRAL_ALERTA:
+            if not self.en_alerta:
+                self.en_alerta = True
+                avisar_ram_alta(porcentaje)
+        else:
+            self.en_alerta = False
 
 
 def main():
